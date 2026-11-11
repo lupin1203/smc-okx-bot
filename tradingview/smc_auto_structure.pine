@@ -1,0 +1,260 @@
+//@version=5
+// SMC 自動結構：CHoCH / BOS / Order Block / FVG / 進場框
+indicator("SMC 自動結構 (CHoCH / OB / FVG)", shorttitle="SMC Auto", overlay=true,
+     max_boxes_count=500, max_lines_count=500, max_labels_count=500, max_bars_back=1000)
+
+// ───────────── 輸入 ─────────────
+grpS = "結構"
+swingLen = input.int(5, "主結構 Swing 長度", minval=2, group=grpS, tooltip="左右各幾根K棒確認一個高/低點。越大 = 結構越大、訊號越少")
+intLen   = input.int(2, "OB 起點 (內部) Swing 長度", minval=1, group=grpS, tooltip="用來找突破那一段走勢的起點 (圖中的 Lower High)")
+useClose = input.bool(true, "以收盤價確認突破", group=grpS)
+showBOS  = input.bool(false, "顯示 BOS", group=grpS)
+lineCol  = input.color(color.white, "結構線顏色", group=grpS)
+confirmBar = input.bool(true, "K棒收盤後才確認 (不重繪)", group=grpS, tooltip="開: CHoCH 與進場框要等這根K棒收完才出現，不會出現後又消失\n關: 盤中觸價就先畫，但 CHoCH 可能在收盤前消失")
+
+grpH = "高週期方向過濾"
+useHTF   = input.bool(true, "啟用高週期過濾", group=grpH, tooltip="只畫/只進與高週期結構同方向的 OB、FVG 與交易框")
+htfTf    = input.timeframe("60", "高週期", group=grpH)
+htfSwing = input.int(5, "高週期 Swing 長度", minval=2, group=grpH)
+showHTF  = input.bool(true, "右上角顯示高週期方向", group=grpH)
+
+grpZ = "區塊"
+showOB     = input.bool(true, "顯示 Order Block", group=grpZ)
+showFVG    = input.bool(true, "顯示 FVG", group=grpZ)
+onlyChoch  = input.bool(true, "只在 CHoCH 時畫 OB / FVG", group=grpZ)
+maxZones   = input.int(5, "每類最多保留幾個", minval=1, maxval=50, group=grpZ)
+delMitig   = input.bool(false, "失效後刪除 (否則只停止延伸)", group=grpZ)
+bullObCol  = input.color(color.new(#26a69a, 75), "多方 OB", group=grpZ)
+bearObCol  = input.color(color.new(#2962ff, 75), "空方 OB", group=grpZ)
+bullFvgCol = input.color(color.new(#00bcd4, 60), "多方 FVG", group=grpZ)
+bearFvgCol = input.color(color.new(#3f51b5, 50), "空方 FVG", group=grpZ)
+
+grpT = "交易框"
+showTrade = input.bool(true, "價格回到 OB 時畫 進場 / 停損 / 停利", group=grpT)
+rr        = input.float(2.0, "風報比 (R)", minval=0.5, step=0.5, group=grpT)
+slBuf     = input.float(0.0, "停損緩衝 (%)", minval=0, step=0.05, group=grpT)
+tradeLen  = input.int(30, "交易框長度 (K棒)", minval=5, group=grpT)
+
+// ───────────── 資料結構 ─────────────
+type Zone
+    box   bx
+    float top
+    float bot
+    int   dir      // 1 = 多方, -1 = 空方
+    bool  active
+    bool  traded
+    int   born
+
+var array<Zone> obZones  = array.new<Zone>()
+var array<Zone> fvgZones = array.new<Zone>()
+
+pushZone(array<Zone> arr, Zone z) =>
+    arr.push(z)
+    if arr.size() > maxZones
+        old = arr.shift()
+        old.bx.delete()
+
+// ───────────── Swing 點 ─────────────
+ph  = ta.pivothigh(high, swingLen, swingLen)
+pl  = ta.pivotlow(low, swingLen, swingLen)
+iph = ta.pivothigh(high, intLen, intLen)
+ipl = ta.pivotlow(low, intLen, intLen)
+
+var float sH     = na
+var int   sHBar  = na
+var bool  sHUsed = true
+var float sL     = na
+var int   sLBar  = na
+var bool  sLUsed = true
+var int   iHBar  = na
+var int   iLBar  = na
+var int   trend  = 0     // 1 多頭, -1 空頭
+
+if not na(ph)
+    sH     := ph
+    sHBar  := bar_index - swingLen
+    sHUsed := false
+if not na(pl)
+    sL     := pl
+    sLBar  := bar_index - swingLen
+    sLUsed := false
+if not na(iph)
+    iHBar := bar_index - intLen
+if not na(ipl)
+    iLBar := bar_index - intLen
+
+// ───────────── 高週期方向 ─────────────
+htfTrendCalc() =>
+    var int   t = 0
+    var float h = na
+    var float l = na
+    hp = ta.pivothigh(high, htfSwing, htfSwing)
+    lp = ta.pivotlow(low, htfSwing, htfSwing)
+    if not na(hp)
+        h := hp
+    if not na(lp)
+        l := lp
+    if not na(h) and close > h
+        t := 1
+        h := na
+    if not na(l) and close < l
+        t := -1
+        l := na
+    t
+
+// [1] + lookahead_on = 只用已收盤的高週期K棒，不重繪
+htfTrend = request.security(syminfo.tickerid, htfTf, htfTrendCalc()[1], lookahead=barmerge.lookahead_on)
+allowDir(int d) => not useHTF or htfTrend == d
+canConfirm = not confirmBar or barstate.isconfirmed
+
+// ───────────── 工具函式 ─────────────
+drawStruct(float lvl, int fromBar, string txt, bool bull) =>
+    line.new(fromBar, lvl, bar_index, lvl, color=lineCol, width=1,
+         style = txt == "CHoCH" ? line.style_solid : line.style_dashed)
+    label.new(int((fromBar + bar_index) / 2), lvl, txt, color=color(na), textcolor=lineCol,
+         style = bull ? label.style_label_down : label.style_label_up, size=size.small)
+
+// 找出造成突破那段走勢的起點，回傳 OB K棒的 offset
+findOB(bool bull, int brokenBar) =>
+    span   = math.min(bar_index - brokenBar, 500)
+    intBar = bull ? iLBar : iHBar
+    int org = 0
+    if not na(intBar) and intBar > brokenBar and intBar < bar_index
+        org := bar_index - intBar
+    if org == 0
+        for k = 0 to span
+            if bull ? low[k] < low[org] : high[k] > high[org]
+                org := k
+    // 起點附近最後一根反向K棒 (空方 OB = 陽線, 多方 OB = 陰線)
+    ob = org
+    for k = org to org + 5
+        if bull ? close[k] < open[k] : close[k] > open[k]
+            ob := k
+            break
+    ob
+
+// 在 OB 之後的推動段中找第一個 FVG
+findFVG(bool bull, int obOff) =>
+    float t = na
+    float b = na
+    int   l = na
+    if obOff >= 2
+        for k = obOff - 2 to 0
+            gap = bull ? low[k] > high[k + 2] : high[k] < low[k + 2]
+            if gap
+                t := bull ? low[k] : low[k + 2]
+                b := bull ? high[k + 2] : high[k]
+                l := bar_index - k - 1
+                break
+    [t, b, l]
+
+makeZones(bool bull, int brokenBar) =>
+    obOff = findOB(bull, brokenBar)
+    d = bull ? 1 : -1
+    if showOB
+        t  = high[obOff]
+        b  = low[obOff]
+        bx = box.new(bar_index - obOff, t, bar_index + 1, b, border_color=color(na),
+             bgcolor = bull ? bullObCol : bearObCol, text="Order Block",
+             text_color=color.new(color.white, 20), text_size=size.small)
+        pushZone(obZones, Zone.new(bx, t, b, d, true, false, bar_index))
+    if showFVG
+        [ft, fb, fl] = findFVG(bull, obOff)
+        if not na(ft)
+            fx = box.new(fl, ft, bar_index + 1, fb, border_color=color(na),
+                 bgcolor = bull ? bullFvgCol : bearFvgCol, text="FVG",
+                 text_color=color.new(color.white, 20), text_size=size.tiny)
+            pushZone(fvgZones, Zone.new(fx, ft, fb, d, true, false, bar_index))
+
+updateZones(array<Zone> arr, bool isFvg) =>
+    if arr.size() > 0
+        for i = arr.size() - 1 to 0
+            z = arr.get(i)
+            if z.active
+                bool fvgBroken = z.dir == 1 ? low < z.bot : high > z.top
+                bool obBroken  = z.dir == 1 ? close < z.bot : close > z.top
+                bool broken    = isFvg ? fvgBroken : obBroken
+                if broken
+                    z.active := false
+                    if delMitig
+                        arr.remove(i)
+                        z.bx.delete()
+                else
+                    z.bx.set_right(bar_index + 1)
+
+// ───────────── 主邏輯 ─────────────
+// ───────────── 回測 OB → 進場框 (先判斷成交，再判斷失效：與真實掛單一致) ─────────────
+bool longEntry  = false
+bool shortEntry = false
+if showTrade and canConfirm and obZones.size() > 0
+    for i = 0 to obZones.size() - 1
+        z = obZones.get(i)
+        if z.active and not z.traded and bar_index > z.born and allowDir(z.dir)
+            tapped = z.dir == -1 ? high >= z.bot : low <= z.top
+            if tapped
+                z.traded := true
+                if z.dir == -1
+                    entry = z.bot
+                    sl    = z.top * (1 + slBuf / 100)
+                    tp    = entry - rr * (sl - entry)
+                    box.new(bar_index, sl, bar_index + tradeLen, entry, border_color=color(na),
+                         bgcolor=color.new(color.red, 70), text="SL " + str.tostring(sl, format.mintick),
+                         text_color=color.white, text_size=size.tiny, text_valign=text.align_top)
+                    box.new(bar_index, entry, bar_index + tradeLen, tp, border_color=color(na),
+                         bgcolor=color.new(color.teal, 70), text="TP " + str.tostring(tp, format.mintick) + " (" + str.tostring(rr) + "R)",
+                         text_color=color.white, text_size=size.tiny, text_valign=text.align_bottom)
+                    shortEntry := true
+                else
+                    entry = z.top
+                    sl    = z.bot * (1 - slBuf / 100)
+                    tp    = entry + rr * (entry - sl)
+                    box.new(bar_index, entry, bar_index + tradeLen, sl, border_color=color(na),
+                         bgcolor=color.new(color.red, 70), text="SL " + str.tostring(sl, format.mintick),
+                         text_color=color.white, text_size=size.tiny, text_valign=text.align_bottom)
+                    box.new(bar_index, tp, bar_index + tradeLen, entry, border_color=color(na),
+                         bgcolor=color.new(color.teal, 70), text="TP " + str.tostring(tp, format.mintick) + " (" + str.tostring(rr) + "R)",
+                         text_color=color.white, text_size=size.tiny, text_valign=text.align_top)
+                    longEntry := true
+
+// ───────────── OB / FVG 失效判斷 ─────────────
+updateZones(obZones, false)
+updateZones(fvgZones, true)
+
+bool bullChochNow = false
+bool bearChochNow = false
+
+srcUp = useClose ? close : high
+srcDn = useClose ? close : low
+
+if canConfirm and not sHUsed and srcUp > sH
+    isChoch = trend <= 0
+    if isChoch or showBOS
+        drawStruct(sH, sHBar, isChoch ? "CHoCH" : "BOS", true)
+    if (isChoch or not onlyChoch) and allowDir(1)
+        makeZones(true, sHBar)
+    bullChochNow := isChoch
+    sHUsed := true
+    trend  := 1
+
+if canConfirm and not sLUsed and srcDn < sL
+    isChoch = trend >= 0
+    if isChoch or showBOS
+        drawStruct(sL, sLBar, isChoch ? "CHoCH" : "BOS", false)
+    if (isChoch or not onlyChoch) and allowDir(-1)
+        makeZones(false, sLBar)
+    bearChochNow := isChoch
+    sLUsed := true
+    trend  := -1
+
+// ───────────── 高週期方向面板 ─────────────
+var table htfTbl = table.new(position.top_right, 1, 1)
+if showHTF and useHTF and barstate.islast
+    htfTxt = htfTrend == 1 ? "多頭 ▲" : htfTrend == -1 ? "空頭 ▼" : "未定"
+    htfBg  = htfTrend == 1 ? color.new(#26a69a, 20) : htfTrend == -1 ? color.new(#ef5350, 20) : color.new(color.gray, 20)
+    table.cell(htfTbl, 0, 0, htfTf + " 結構: " + htfTxt, text_color=color.white, bgcolor=htfBg, text_size=size.small)
+
+// ───────────── 警報 ─────────────
+alertcondition(bullChochNow, "多方 CHoCH", "多方 CHoCH 出現 {{ticker}} {{close}}")
+alertcondition(bearChochNow, "空方 CHoCH", "空方 CHoCH 出現 {{ticker}} {{close}}")
+alertcondition(longEntry,  "回測多方 OB", "價格回到多方 Order Block {{ticker}} {{close}}")
+alertcondition(shortEntry, "回測空方 OB", "價格回到空方 Order Block {{ticker}} {{close}}")
