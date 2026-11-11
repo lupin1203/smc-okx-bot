@@ -37,15 +37,16 @@ import urllib.error
 import urllib.request
 from datetime import datetime, timezone
 
-import numpy as np
 import pandas as pd
 
-from events import blackout_mask, event_times_utc
+from events import CPI, FOMC, NFP, blackout_mask
 
 BASE_URL = "https://www.okx.com"
 HERE = os.path.dirname(os.path.abspath(__file__))
 
 ENTRY_N, EXIT_N, ATR_N, ATR_MULT, SMA_N = 55, 20, 20, 2.0, 200
+MAX_STOP_VS_LIQ = 0.7      # 停損距離最多只能到強平距離 (1/槓桿) 的 70%
+EVENT_WARN_DAYS = 14       # 事件日曆剩不到幾天就開始提醒更新
 
 log = logging.getLogger("okx_bot")
 
@@ -95,17 +96,28 @@ class OKX:
                 headers["x-simulated-trading"] = "1"
         req = urllib.request.Request(BASE_URL + path + query, data=data.encode() if data else None,
                                      method=method, headers=headers)
+        # GET 可以放心重試。POST (下單 / 平倉 / 設槓桿) 只有在「確定 OKX 沒有處理」時才重試 (429 限流)：
+        # 逾時或 5xx 時請求可能其實已經成交，再送一次就會重複下單。
+        retry_codes = (429, 500, 502, 503, 504) if method == "GET" else (429,)
+        res = {"code": "net", "msg": "no response"}
         for attempt in range(5):
             try:
                 with urllib.request.urlopen(req, timeout=20) as r:
                     res = json.load(r)
                 break
             except urllib.error.HTTPError as e:
-                res = json.loads(e.read() or b"{}")
-                if e.code not in (429, 500, 502, 503, 504):
+                try:
+                    res = json.loads(e.read() or b"{}")
+                except ValueError:  # 回應不是 JSON (例如閘道錯誤頁)
+                    res = {}
+                res.setdefault("code", f"http{e.code}")
+                res.setdefault("msg", str(e))
+                if e.code not in retry_codes:
                     break
-            except Exception as e:  # 網路錯誤
+            except Exception as e:  # 網路錯誤 / 逾時
                 res = {"code": "net", "msg": str(e)}
+                if method != "GET":
+                    break
             time.sleep(2 ** attempt)
         if res.get("code") != "0":
             raise RuntimeError(f"OKX {method} {path} 失敗: {res.get('code')} {res.get('msg')} {res.get('data')}")
@@ -173,6 +185,11 @@ def compute_signal(df: pd.DataFrame, mode: str) -> dict:
                 hh=float(hh.iloc[-1]), ll=float(ll.iloc[-1]), xh=float(xh.iloc[-1]), xl=float(xl.iloc[-1]))
 
 
+def calendar_days_left(now: pd.Timestamp) -> int:
+    """事件日曆還能涵蓋幾天: 取 CPI / NFP / FOMC 三份清單中最早用完的那一份 (負數 = 已經過期)。"""
+    return min(int((pd.Timestamp(max(dates), tz="UTC") - now).days) for dates in (CPI, NFP, FOMC))
+
+
 def in_blackout(now: pd.Timestamp) -> bool:
     idx = pd.DatetimeIndex([now.floor("15min")])
     return bool(blackout_mask(idx, 4.0, pd.Timedelta(minutes=15))[0])
@@ -229,6 +246,15 @@ class Bot:
         tick = float(ins["tickSz"])
         price = sig["close"]
         stop_dist = ATR_MULT * sig["atr"]
+        if not (math.isfinite(stop_dist) and stop_dist > 0 and price > 0):
+            log.warning("%s ATR 無效 (%s), 略過", inst, sig["atr"])
+            return
+        # 逐倉 N 倍槓桿大約在價格反向走 1/N 時強平。停損距離太接近強平價的話,
+        # 會在停損觸發前就被強平 (虧掉整筆保證金, 比預設的 RISK_PCT 大)。
+        if stop_dist / price >= MAX_STOP_VS_LIQ / self.cfg.leverage:
+            log.warning("%s 停損距離 %.1f%% 太接近 %dx 槓桿的強平距離 (約 %.1f%%), 略過; 請調低 LEVERAGE",
+                        inst, stop_dist / price * 100, self.cfg.leverage, 100 / self.cfg.leverage)
+            return
         sl = price - d * stop_dist
         risk_usdt = equity * self.cfg.risk_pct
         contracts = risk_usdt / (stop_dist * ct_val)
@@ -259,8 +285,11 @@ class Bot:
 
     def run_once(self):
         now = pd.Timestamp.now(tz="UTC")
-        if max(event_times_utc()) < now:
-            log.warning("events.py 的重大事件日期已過期, 請更新 CPI / NFP / FOMC 日期")
+        days_left = calendar_days_left(now)
+        if days_left < 0:
+            log.warning("events.py 的重大事件日期已過期: 現在完全沒有事件迴避, 請更新 CPI / NFP / FOMC 日期")
+        elif days_left < EVENT_WARN_DAYS:
+            log.warning("events.py 的事件日曆只剩 %d 天, 請補上之後的 CPI / NFP / FOMC 日期", days_left)
         blocked = in_blackout(now)
         if blocked:
             log.info("重大事件前後 4 小時: 本輪不開新倉")
@@ -328,7 +357,12 @@ def main():
         bot.run_once()
         return
     while True:
-        bot.run_once()
+        # 單次失敗 (例如查餘額時網路斷線) 不能讓常駐程式整個結束, 否則之後的出場訊號都不會執行。
+        # 已掛在 OKX 上的停損單不受影響; 這一輪略過, 下一根 K 棒再試。
+        try:
+            bot.run_once()
+        except Exception:
+            log.exception("本輪執行失敗, 下一根 K 棒再試")
         sleep_until_next_bar()
 
 

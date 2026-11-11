@@ -6,6 +6,12 @@
 python fetch_okx.py BTC-USDT-SWAP 15m 730   # 下載 2 年 15m K線到 data/ (公開 API, 不需 Key)
 python fetch_okx.py ETH-USDT-SWAP 15m 730
 python run_backtest.py                      # 參數掃描 → results/grid_results.csv
+
+python fetch_okx.py BTC-USDT-SWAP 4H 1500   # 4H / 日線回測用的資料 (五個幣都要抓)
+python run_htf.py                           # SMC + 趨勢策略 → results/htf_results.csv
+python leverage_test.py 2                   # 槓桿 / 爆倉壓力測試 (固定 2% 停損)
+
+python -m pytest -q                         # 單元測試 (不連網、不需要 API Key)
 ```
 
 - `smc_engine.py`：結構偵測 (swing / CHoCH / OB)、高週期過濾、逐K回測
@@ -41,8 +47,22 @@ export OKX_DEMO=1
 
 ### 3. 執行
 ```bash
-pip install pandas numpy
+pip install -r requirements.txt
 python okx_bot.py --once   # 跑一次看訊號與帳戶狀態
 python okx_bot.py          # 常駐，每根 4H K棒收盤後 30 秒執行
 ```
 紀錄寫在 `logs/okx_bot.log`。模擬盤跑 1–2 個月確認正常後，才把 `OKX_DEMO` 改成 `0` 並換成實盤 Key。
+
+### 4. 安全機制與已知限制
+
+機器人內建的保護：
+- **下單不重送**：下單、平倉的請求如果逾時或遇到 5xx，不會自動重試（請求可能其實已經成交，重送會重複下單）。只有被限流 (429) 才重試。失敗的那一輪會略過，下一根 K 棒再依實際持倉判斷
+- **停損太接近強平價就不開倉**：停損距離超過「1 ÷ 槓桿」的 70% 時略過，並提示調低 `LEVERAGE`
+- **單輪失敗不會讓程式結束**：查餘額、查持倉失敗時記錄錯誤，下一根 K 棒再試；已掛在 OKX 的停損單不受影響
+- **事件日曆到期提醒**：`events.py` 的日期剩不到 14 天會在紀錄裡提醒。**日期用完之後就沒有事件迴避了**，要自己補上新的 CPI / NFP / FOMC 日期
+
+還沒做的（實盤前請自己留意）：
+- 開倉後沒有再查一次確認停損單真的掛上去了；請在 OKX App 上看一眼
+- 沒有「單日 / 總虧損上限」的自動停機
+- 回測 (`trend.py`) 沒有模擬事件迴避，和機器人的實際行為有一點差異
+- 雙向持倉模式下，同一個幣同時有多單和空單時只會管到其中一邊；建議用單向持倉 (net mode)

@@ -53,6 +53,7 @@ def main():
             jobs.append(("trend", sym, tf, htf, dict(zip(trend_grid, combo))))
     with ProcessPoolExecutor() as ex:
         rows = [r for res in ex.map(job, jobs, chunksize=4) for r in res]
+    os.makedirs(os.path.join(HERE, "results"), exist_ok=True)
     pd.DataFrame(rows).to_csv(os.path.join(HERE, "results", "htf_results.csv"), index=False)
     # 買進持有對照
     for sym in SYMBOLS:

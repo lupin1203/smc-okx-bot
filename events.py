@@ -6,7 +6,7 @@
 - FOMC: federalreserve.gov/monetarypolicy/fomccalendars.htm (會議最後一天 = 決議公布日)
 時間: CPI、NFP 美東 08:30; FOMC 美東 14:00 (自動處理夏令時間)
 """
-from datetime import datetime, timedelta
+from datetime import datetime
 from zoneinfo import ZoneInfo
 
 import numpy as np
